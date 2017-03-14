@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+
+from os.path import join
+from os import environ, geteuid
+from subprocess import check_call
+from shlex import split as shsplit
+from argparse import ArgumentParser
+
+
+APACHE = type('Apache', (object,), {
+    variable: environ.get(variable, default)
+    for variable, default in [
+        ('APACHE_ROOT', '/var/www/'),
+        ('APACHE_LOG_DIR', '/var/log/apache2/'),
+        ('APACHE_RUN_USER', 'www-data'),
+        ('APACHE_RUN_GROUP', 'www-data'),
+        ('APACHE_SITES_AVAILABLE', '/etc/apache2/sites-available/')
+    ]
+})()
+
+
+INDEX_TPL = """\
+<h1>Index for {}</h1>
+"""
+
+
+VIRTUAL_HOST_TPL = """\
+<VirtualHost *:80>
+    ServerAdmin {email}
+    ServerName {subdomain}.{domain}
+
+    # HTTPS redirect
+    RewriteEngine On
+    RewriteCond %{{HTTPS}} off
+    RewriteRule (.*) https://%{{HTTP_HOST}}%{{REQUEST_URI}} [last,redirect=301]
+
+    # Indexes + Directory Root.
+    DirectoryIndex index.html
+    DocumentRoot {root}
+
+    # Logs
+    ErrorLog ${{APACHE_LOG_DIR}}/{domain}/{subdomain}.error.log
+    CustomLog ${{APACHE_LOG_DIR}}/{domain}/{subdomain}.access.log combined
+    LogLevel warn
+
+</VirtualHost>
+
+<IfModule mod_ssl.c>
+<VirtualHost *:443>
+    ServerAdmin {email}
+    ServerName {subdomain}.{domain}
+
+    # Indexes + Directory Root.
+    DirectoryIndex index.html
+    DocumentRoot {root}
+
+    # Logs
+    ErrorLog ${{APACHE_LOG_DIR}}/{domain}/{subdomain}.error.log
+    CustomLog ${{APACHE_LOG_DIR}}/{domain}/{subdomain}.access.log combined
+    LogLevel warn
+
+    # SSL
+    Include /etc/letsencrypt/options-ssl-apache.conf
+    SSLCertificateFile /etc/letsencrypt/live/{subdomain}.{domain}/cert.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/{subdomain}.{domain}/privkey.pem
+    SSLCertificateChainFile /etc/letsencrypt/live/{subdomain}.{domain}/chain.pem
+
+</VirtualHost>
+</IfModule>
+"""  # noqa
+
+
+def _wrap_with(code):
+    def inner(text, bold=False):
+        c = code
+        if bold:
+            c = '1;{}'.format(c)
+        return '\033[{}m{}\033[0m'.format(c, text)
+    return inner
+
+
+red = _wrap_with('31')
+green = _wrap_with('32')
+yellow = _wrap_with('33')
+blue = _wrap_with('34')
+magenta = _wrap_with('35')
+cyan = _wrap_with('36')
+white = _wrap_with('37')
+
+
+def run(command):
+    check_call(shsplit(command))
+
+
+def step(message):
+    print(white('- {} ...'.format(message), bold=True))
+
+
+def success(message):
+    print(green('{} ... DONE'.format(message)))
+
+
+def parse_args(argv=None):
+    parser = ArgumentParser(description='Create a new site')
+    parser.add_argument(
+        'subdomain',
+        help='Subdomain of the new site'
+    )
+    parser.add_argument(
+        'domain',
+        help='Domain of the new site'
+    )
+    parser.add_argument(
+        'email',
+        help='Administrator email (used by '
+    )
+
+    args = parser.parse_args(args=argv)
+    return args
+
+
+def main(args):
+    domain = args.domain
+    subdomain = args.subdomain
+    email = args.email
+    step('Adding site {}.{}'.format(subdomain, domain))
+
+    # Create root and logging directories
+    step('Creating directories')
+    root = join(APACHE.APACHE_ROOT, domain, subdomain, 'htdocs')
+    logs = join(APACHE.APACHE_LOG_DIR, domain)
+
+    run('mkdir -p {}'.format(root))
+    run('chown -R {}:{} {}'.format(
+        APACHE.APACHE_RUN_USER,
+        APACHE.APACHE_RUN_GROUP,
+        join(APACHE.APACHE_ROOT, domain)
+    ))
+    success(root)
+
+    run('mkdir -p {}'.format(logs))
+    run('chown root:adm {}'.format(logs))
+    run('chmod 750 {}'.format(logs))
+    success(logs)
+
+    # Create placeholder index file
+    step('Creating index file')
+    index = join(root, 'index.html')
+
+    with open(index, 'w') as fd:
+        fd.write(
+            INDEX_TPL.format('{}.{}'.format(subdomain, domain))
+        )
+
+    run('chown {}:{} {}'.format(
+        APACHE.APACHE_RUN_USER,
+        APACHE.APACHE_RUN_GROUP,
+        index
+    ))
+    success(index)
+
+    # Create virtual host
+    step('Creating virtual host file')
+    virtualhost = join(
+        APACHE.APACHE_SITES_AVAILABLE,
+        '{}.{}.conf'.format(subdomain, domain)
+    )
+
+    with open(virtualhost, 'w') as fd:
+        fd.write(
+            VIRTUAL_HOST_TPL.format(
+                email=email,
+                subdomain=subdomain,
+                domain=domain,
+                root=root
+            )
+        )
+    success(virtualhost)
+
+    # Create certificate
+    step('Requesting certificate')
+    run(
+        'letsencrypt certonly '
+        '--agree-tos '
+        '--email {} '
+        '--non-interactive '
+        '--apache -d {}.{}'.format(
+            email, subdomain, domain
+        )
+    )
+    success('/etc/letsencrypt/live/{}.{}'.format(subdomain, domain))
+
+    # Enable virtual host
+    step('Enabling virtual host')
+    siteenable = 'a2ensite {}.{}.conf'.format(subdomain, domain)
+    run(siteenable)
+    success(siteenable)
+
+    # Reload apache
+    step('Reloading Apache')
+    apachereload = 'systemctl reload apache2'
+    run(apachereload)
+    success(apachereload)
+
+    print(green('[DONE]', bold=True))
+
+
+if __name__ == '__main__':
+    if geteuid() != 0:
+        print(red('You must be root. Aborting ...'))
+        exit(1)
+
+    args = parse_args()
+    main(args)
