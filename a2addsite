@@ -180,7 +180,7 @@ def main(args):
     # Create certificate
     step('Requesting certificate')
     run(
-        'letsencrypt certonly '
+        'certbot certonly '
         '--agree-tos '
         '--email {} '
         '--non-interactive '
